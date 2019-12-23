@@ -7,22 +7,23 @@
 
 #include <avr/io.h>
 #include <stdint.h>
-#include <util/delay.h> //F_CPU="20000000" or 20MHz clock
+#include <util/delay.h> 
 #include <avr/interrupt.h>
 #include "TM1637.h"
 #include "BCD_encoder.h"
 
 //function prototypes
+void cpu_clock_init();
 void init_ADC();
 void init_timers();
 uint16_t get_adc(uint8_t sel_pin); //sel_pin = ADC_V or ADC_I
 void variable_delay(uint16_t delay);
-uint16_t rpm_out();
+uint16_t rpm_out(uint16_t per_size);
 void ramp_spindle_up();
 void ramp_spindle_down();
 
 //Global values
-#define cpu_speed (20000000 * 10) // cycles per min / 20MHz * 60s
+#define cpu_speed (20000000 * 60) // cycles per min / 20MHz * 60s - F_CPU="20000000"
 #define spindle_steps 1600 // 1/8th step
 #define min_spindle_driver_pulse_delay 100 //micro seconds (us)
 
@@ -31,10 +32,10 @@ void ramp_spindle_down();
 #define feed_sprocket_teeth 60
 #define feed_mm_per_rotation 1.8702857 //7/16 OD, 14 TPI lead screw - adjust by +0.056mm/rev calibration (for pulley variation, thread etc.
 #define feed_mm_per_step (float)(feed_mm_per_rotation / ((float)feed_steps * ((float)feed_sprocket_teeth / (float)feed_motor_teeth)))
-#define feed_default_rate 800
+#define feed_default_PER 800
 
-#define ramp_duration_high 30 //number of seconds to ramp up speed > 500rpm
-#define ramp_duration_low 2 // < 500rpm
+volatile uint16_t ramp_loops = -1;
+#define ramp_acceleration 10 //ramp acceleration rpm / s / s
 
 #define max_rpm 1200 //max rpm - change the number of steps for the sub 100rpm
 #define adc_block_size 6 //makes control easier for the potentiometer
@@ -59,10 +60,9 @@ volatile uint8_t spindle_clock_divider = 0;
 //const uint8_t divider_64   = 0b00001010; // 1/64 
 //const uint8_t divider_256  = 0b00001100; // 1/256 
 //const uint8_t divider_1024 = 0b00001110; // 1/1024 
-#define bins 8
+#define bins 4
 const uint16_t spindle_clock_divider_array[bins] = {16, 64, 256, 1024}; //{1, 2, 4, 8, 16, 64, 256, 1024} only using subset as this gets us the required value
 const uint8_t divider_array[bins] = {0b00001000 ,0b00001010, 0b00001100, 0b00001110}; //{0b00000000, 0b00000010, 0b00000100, 0b00000110, 0b00001000 ,0b00001010, 0b00001100, 0b00001110}
-volatile uint16_t ramp_loops = -1;
 
 
 //inputs
@@ -183,6 +183,9 @@ ISR (PORTB_PORT_vect)
 ///////////////////////////////////////////////////////////////////////////////
 int main(void)
 {
+	//set CPU to run at full speed (default is 3.3MHz)
+	cpu_clock_init();
+	
 	//set input, pull-ups on pins, interrupt from pins, etc
 	spindle_enable_switch_control =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm; 
 	spindle_direction_switch_control =	PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
@@ -223,7 +226,7 @@ int main(void)
 		|| (feed_direction_switch_port.IN & feed_direction_switch_mask) >= 1 )
 		
 		{
-				
+				//wait
 		}
 		
 		interlock = 0;
@@ -234,7 +237,7 @@ int main(void)
 		for (uint8_t i = 0; i <= 6; i++)
 		{
 			step_spindle_port.OUTTGL = step_spindle_mask;
-			_delay_ms(50);
+			_delay_ms(min_spindle_driver_pulse_delay);
 		}
 		
 		step_spindle_port.OUTCLR = step_spindle_mask;
@@ -263,19 +266,17 @@ int main(void)
 			TCB0.CTRLA &= ~TCB_ENABLE_bm;
 			
 			//scale main clock - default
-			spindle_clock_divider = 5; //div_64
+			spindle_clock_divider = bins-1; //div_max
 			TCA0.SPLIT.CTRLA |= divider_array[spindle_clock_divider];
 			TCA0.SPLIT.CTRLB = TCA_SPLIT_HCMP0EN_bm; //enable timer interrupt
 			//setup safe - lowest frequency
 			TCA0.SPLIT.HPER = 255;
 			TCA0.SPLIT.HCMP0 = 128;
 			
-			//set feed rate
-			TCB0.CCMP = feed_default_rate; //set pulse length
-			
 			//set the ramp counters to max
 			spindle_ramp_counter = -1;
 			feed_ramp_counter = -1;
+			
 			
 			while (interlock == 0 && run_spindle == 0 && run_feed == 0)
 			{
@@ -318,35 +319,16 @@ int main(void)
 				//update analogue value to nearest value for the selected clock divider
 				analogue_value = temp_integer;
 				
+				ramp_loops = (uint16_t)(ramp_acceleration * ((float)cpu_speed / ((float)spindle_clock_divider_array[spindle_clock_divider] * analogue_value * 1200)));
+				
 				//update the clock divider.
 				cli();
 				TCA0.SPLIT.CTRLA = 0;
 				TCA0.SPLIT.CTRLA |= divider_array[spindle_clock_divider];
 				sei();
 				
-				//calculate the number of loops to get the required ramp duration
-				float total_cycles = 0;
 				
-				for (uint8_t i = 255; i >= analogue_value; i--)
-				{
-					total_cycles = total_cycles + i;
-				}
-				
-				//calculate the number loops per increment
-				float ramp_time = 30;
-				
-				if (spindle_speed >= 500)
-				{
-					ramp_time = ramp_duration_high;
-				}
-				else
-				{
-					ramp_time = ramp_duration_low;
-				}
-				
-				ramp_loops = (uint16_t)(ramp_time * ((float)cpu_speed / ((float)spindle_clock_divider_array[spindle_clock_divider] * total_cycles * 10)));
-				
-				led.send_number(rpm_out()); //sends the rpm
+				led.send_number(rpm_out(analogue_value)); //sends the rpm
 			}
 			
 		}
@@ -355,6 +337,8 @@ int main(void)
 		//spindle only
 		while ( (interlock == 0 && run_spindle == 1 && run_feed == 0 && dir_spindle == 0) || (interlock == 0 && run_spindle == 1 && run_feed == 0 && dir_spindle == 1 && spindle_speed <= 20) )
 		{
+			_delay_ms(min_spindle_driver_pulse_delay);
+			
 			uint8_t old_dir_spindle = dir_spindle;
 			
 			//check for previous running
@@ -382,10 +366,10 @@ int main(void)
 				//ramp speed down
 				ramp_spindle_down();
 				
+				//disable spindle
+				spindle_enable_port.OUTCLR = spindle_enable_mask;
 			}
 			
-			//disable spindle
-			spindle_enable_port.OUTCLR = spindle_enable_mask;
 			
 		}
 		
@@ -393,6 +377,11 @@ int main(void)
 		//feed only
 		while (interlock == 0 && run_spindle == 0 && run_feed == 1)
 		{
+			_delay_ms(min_spindle_driver_pulse_delay);
+			
+			//set feed rate
+			TCB0.CCMP = feed_default_PER; //set pulse length
+			
 			//enable timers
 			TCB0.CTRLA |= TCB_ENABLE_bm;
 			
@@ -414,6 +403,11 @@ int main(void)
 		//spindle must be started / running before entering this mode
 		while (interlock == 0 && run_spindle == 1 && spindle_ramp_counter == 0 && run_feed == 1 && spindle_speed > 20)
 		{
+			_delay_ms(min_spindle_driver_pulse_delay);
+			
+			//set feed rate
+			TCB0.CCMP = feed_default_PER*20; //set pulse length
+			
 			//enable feed timer
 			TCB0.CTRLA |= TCB_ENABLE_bm; //enable clock	
 			
@@ -443,9 +437,11 @@ int main(void)
 		}
 		
 		//////////////////////////////////////////////////////////////////////////
-		//interlocked spindle with feed / slow spindle
+		//Engaged spindle with feed / slow spindle
 		while (interlock == 0 && run_spindle == 1 && run_feed == 1 && spindle_speed <= 20)
 		{
+			_delay_ms(min_spindle_driver_pulse_delay);
+			
 			//disable timers
 			TCA0.SPLIT.CTRLA &= ~TCA_SPLIT_ENABLE_bm;
 			TCB0.CTRLA &= ~TCB_ENABLE_bm;	
@@ -504,6 +500,12 @@ int main(void)
 }
 
 
+//setup the CPU full 20MHz
+void cpu_clock_init(void) {
+	_PROTECTED_WRITE(CLKCTRL.MCLKCTRLB, 0);
+}
+
+
 //Setup ADC
 void init_ADC()
 {
@@ -538,6 +540,7 @@ void init_timers()
 	TCA0.SPLIT.HCMP0 = 128;
 	TCA0.SPLIT.HCNT = 0; 
 	TCA0.SPLIT.CTRLB = TCA_SPLIT_HCMP0EN_bm;
+	TCA0.SPLIT.DBGCTRL |= TCA_SPLIT_DBGRUN_bm;
 	
 	//scale main clock - default
 	spindle_clock_divider = 5;
@@ -556,6 +559,8 @@ void init_timers()
 				| 0 << TCB_CCMPINIT_bp /* Pin Initial State: enabled, used for input operations */
 				| 0 << TCB_CCMPEN_bp   /* Pin Output Enable: enabled */
 				| TCB_CNTMODE_INT_gc; /* Periodic Interrupt */
+	
+	TCB0.DBGCTRL |= TCB_DBGRUN_bm;
 	
 	TCB0.INTCTRL = TCB_CAPT_bm; //enable interrupt for clocking pin
 }
@@ -577,10 +582,10 @@ uint16_t get_adc(uint8_t sel_pin)
 }
 
 //update LED rpm from ADC
-uint16_t rpm_out()
+uint16_t rpm_out(uint16_t per_size)
 {
 	
-	uint16_t out_number = uint16_t(((float)cpu_speed / ((float)spindle_clock_divider_array[spindle_clock_divider]*float(analogue_value)*(float)spindle_steps)));
+	uint16_t out_number = uint16_t(((float)cpu_speed / ((float)spindle_clock_divider_array[spindle_clock_divider]*float(per_size)*(float)spindle_steps)));
 	
 	return out_number;
 	
@@ -595,13 +600,30 @@ void ramp_spindle_up()
 		TCA0.SPLIT.HPER = n;
 		TCA0.SPLIT.HCMP0 = n/2; //HPER divide by 2 ~50% duty cycle
 		
-		spindle_ramp_counter = ramp_loops; //reset the loop counter
+		//calculate number of loops to delay to achieve required acceleration of xRPM / second
+		//calculate current rpm
+		//calculate next rpm
+		//calculate difference
+		//calculate steps to match required acceleration rpm/second 
+		
+		spindle_ramp_counter = ramp_loops;
 		
 		TCA0.SPLIT.INTCTRL |= TCA_SPLIT_HUNF_bm; //enable interrupt flag
 		
-		while (spindle_ramp_counter != 0)
+		while (spindle_ramp_counter != 0 && run_spindle == 1)
 		{
 			//hold here until interrupt loop finished
+			//delay equal to 
+		}
+		
+		//if ramp up canceled then exit and disable
+		if (run_spindle == 0)
+		{
+			//disable spindle
+			spindle_enable_port.OUTCLR = spindle_enable_mask;
+			
+			//exit ramp up
+			return;
 		}
 	}
 }
@@ -615,7 +637,7 @@ void ramp_spindle_down()
 		TCA0.SPLIT.HPER = n;
 		TCA0.SPLIT.HCMP0 = n/2; //HPER divide by 2 ~50% duty cycle
 		
-		spindle_ramp_counter = ramp_loops; //reset the loop counter
+		spindle_ramp_counter = ramp_loops;
 		
 		TCA0.SPLIT.INTCTRL |= TCA_SPLIT_HUNF_bm; //enable interrupt flag
 		
