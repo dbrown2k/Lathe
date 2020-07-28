@@ -12,6 +12,7 @@
 #include "TM1637.h"
 #include "BCD_encoder.h"
 
+
 //function prototypes
 void cpu_clock_init();
 void init_ADC();
@@ -21,25 +22,31 @@ void variable_delay(uint16_t delay);
 uint16_t rpm_out(uint16_t per_size);
 void ramp_spindle_up();
 void ramp_spindle_down();
+void syncronise_encoder();
+
 
 //Global values
-#define cpu_speed (20000000 * 60) // cycles per min / 20MHz * 60s - F_CPU="20000000"
-#define spindle_steps 1600 // 1/8th step
-#define min_spindle_driver_pulse_delay 100 //micro seconds (us)
+#define CPU_SPEED (F_CPU * 60) // cycles per min
+#define SPINDLE_STEPS 1600 // 1/8th step
+#define MIN_SPINDLE_DRIVER_PULSE_DELAY 100 //micro seconds (us)
 
-#define feed_steps (200 * 16) // 1/8th step, 3200 step per rotation
-#define feed_motor_teeth 21
-#define feed_sprocket_teeth 60
-#define feed_mm_per_rotation 1.8702857 //7/16 OD, 14 TPI lead screw - adjust by +0.056mm/rev calibration (for pulley variation, thread etc.
-#define feed_mm_per_step (float)(feed_mm_per_rotation / ((float)feed_steps * ((float)feed_sprocket_teeth / (float)feed_motor_teeth)))
-#define feed_default_PER 800
+#define FEED_STEPS (200 * 16) // 1/16th step, 3200 step per rotation
+#define FEED_MOTOR_TEETH 21
+#define FEED_SPROCKET_TEETH 60
+#define FEED_MM_PER_ROTATION 1.8702857 //7/16 OD, 14 TPI lead screw - adjust by +0.056mm/rev calibration (for pulley variation, thread etc.
+#define FEED_MM_PER_STEP (float)(FEED_MM_PER_ROTATION / ((float)FEED_STEPS * ((float)FEED_SPROCKET_TEETH / (float)FEED_MOTOR_TEETH)))
 
-volatile uint16_t ramp_loops = -1;
-#define ramp_acceleration 10 //ramp acceleration rpm / s / s
+#define FEED_STEP_DURATION 40 //micro seconds
+#define FEED_DEFAULT_PER (FEED_STEP_DURATION * (F_CPU / 1000000)) //no. cycles per timer step
+#define FEED_BCD_DIVISOR 1000 //BCD counter - 1/1000ths of a millimeter
 
-#define max_rpm 1200 //max rpm - change the number of steps for the sub 100rpm
-#define adc_block_size 6 //makes control easier for the potentiometer
-#define sub_100_steps 3 //number of steps per increment when rpm is less than 100
+volatile uint16_t ramp_loops = -1; //-1 unsigned = max value
+#define RAMP_ACCELERATION 10 //ramp acceleration rpm / s / s
+
+#define MAX_RPM 1200 //max rpm
+#define FINE_CONTROL_RPM 100 //increase resolution below this rpm
+#define STANDARD_CONTROL_STEPS 6 //makes control easier for the potentiometer
+#define FINE_CONTROL_STEPS 3 //number of steps per increment when rpm is less than fine control value
 
 //Global variables
 volatile uint8_t analogue_value = 0;
@@ -49,6 +56,7 @@ volatile uint8_t run_feed = 0;
 volatile uint8_t interlock = 1; //on startup neither should run until after both are off
 volatile uint16_t spindle_speed = 0; //ideal rpm
 volatile uint16_t spindle_ramp_counter = 0;
+volatile uint8_t spindle_running = 0;
 volatile uint8_t feed_ramp_counter = 0;
 volatile uint16_t feed_rate = 0; // mm per revolution of main spindle
 volatile uint8_t spindle_clock_divider = 0;
@@ -60,59 +68,59 @@ volatile uint8_t spindle_clock_divider = 0;
 //const uint8_t divider_64   = 0b00001010; // 1/64 
 //const uint8_t divider_256  = 0b00001100; // 1/256 
 //const uint8_t divider_1024 = 0b00001110; // 1/1024 
-#define bins 4
-const uint16_t spindle_clock_divider_array[bins] = {16, 64, 256, 1024}; //{1, 2, 4, 8, 16, 64, 256, 1024} only using subset as this gets us the required value
-const uint8_t divider_array[bins] = {0b00001000 ,0b00001010, 0b00001100, 0b00001110}; //{0b00000000, 0b00000010, 0b00000100, 0b00000110, 0b00001000 ,0b00001010, 0b00001100, 0b00001110}
+#define BINS 4 //number of subsets of clock divider to get required values
+const uint16_t spindle_clock_divider_array[BINS] = {16, 64, 256, 1024}; //{1, 2, 4, 8, 16, 64, 256, 1024} only using subset as this gets us the required values
+const uint8_t divider_array[BINS] = {0b00001000 ,0b00001010, 0b00001100, 0b00001110}; //{0b00000000, 0b00000010, 0b00000100, 0b00000110, 0b00001000 ,0b00001010, 0b00001100, 0b00001110}
 
 
 //inputs
-#define analogue_main_mask PIN3_bm //PA3 - spindle speed
+#define ANALOGUE_MAIN_MASK PIN3_bm //PA3 - spindle speed potentiometer
 
 //PA4 - feed direction
-#define feed_direction_switch_port PORTA
-#define feed_direction_switch_mask PIN4_bm 
-#define feed_direction_switch_control PORTA.PIN4CTRL
-#define feed_direction_switch_pin_position PIN4_bp
+#define FEED_DIRECTION_SWITCH_PORT PORTA
+#define FEED_DIRECTION_SWITCH_MASK PIN4_bm 
+#define FEED_DIRECTION_SWITCH_CONTROL PORTA.PIN4CTRL
+#define FEED_DIRECTION_SWITCH_PIN_POSITION PIN4_bp
 
 //PA7 - spindle direction
-#define spindle_direction_switch_port PORTA
-#define spindle_direction_switch_mask PIN7_bm 
-#define spindle_direction_switch_control PORTA.PIN7CTRL
-#define spindle_direction_switch_pin_position PIN7_bp
+#define SPINDLE_DIRECTION_SWITCH_PORT PORTA
+#define SPINDLE_DIRECTION_SWITCH_MASK PIN7_bm 
+#define SPINDLE_DIRECTION_SWITCH_CONTROL PORTA.PIN7CTRL
+#define SPINDLE_DIRECTION_SWITCH_PIN_POSITION PIN7_bp
 
 //PA6 - spindle enable - ext interrupt
-#define spindle_enable_switch_port PORTA
-#define spindle_enable_switch_mask PIN6_bm 
-#define spindle_enable_switch_pin_position PIN6_bp
-#define spindle_enable_switch_control PORTA.PIN6CTRL 
+#define SPINDLE_ENABLE_SWITCH_PORT PORTA
+#define SPINDLE_ENABLE_SWITCH_MASK PIN6_bm 
+#define SPINDLE_ENABLE_SWITCH_PIN_POSITION PIN6_bp
+#define SPINDLE_ENABLE_SWITCH_CONTROL PORTA.PIN6CTRL 
 
 //PB2 - feed enable - ext interrupt
-#define feed_enable_switch_port PORTB
-#define feed_enable_switch_mask PIN2_bm 
-#define feed_enable_switch_pin_position PIN2_bp
-#define feed_enable_switch_control PORTB.PIN2CTRL
+#define FEED_ENABLE_SWITCH_PORT PORTB
+#define FEED_ENABLE_SWITCH_MASK PIN2_bm 
+#define FEED_ENABLE_SWITCH_PIN_POSITION PIN2_bp
+#define FEED_ENABLE_SWITCH_CONTROL PORTB.PIN2CTRL
 
 
 //control outputs
 //PC1 - enable spindle - active low
-#define spindle_enable_port PORTC
-#define spindle_enable_mask PIN1_bm 
-#define spindle_enable_control PORTC.PIN1CTRL
+#define SPINDLE_ENABLE_PORT PORTC
+#define SPINDLE_ENABLE_MASK PIN1_bm 
+#define SPINDLE_ENABLE_CONTROL PORTC.PIN1CTRL
 
 //PC2 - enable feed - active low
-#define feed_enable_port PORTC
-#define feed_enable_mask PIN2_bm 
-#define feed_enable_control PORTC.PIN2CTRL
+#define FEED_ENABLE_PORT PORTC
+#define FEED_ENABLE_MASK PIN2_bm 
+#define FEED_ENABLE_CONTROL PORTC.PIN2CTRL
 
 //PC3 - step spindle - timer counter A (TCA0)
-#define step_spindle_port PORTC
-#define step_spindle_mask PIN3_bm
-#define step_spindle_control PORTC.PIN3CTRL
+#define STEP_SPINDLE_PORT PORTC
+#define STEP_SPINDLE_MASK PIN3_bm
+#define STEP_SPINDLE_CONTROL PORTC.PIN3CTRL
 
 //PC0 - step feed - timer counter B (TCB0)
-#define step_feed_port PORTC
-#define step_feed_mask PIN0_bm
-#define step_feed_control PORTC.PIN0CTRL
+#define STEP_FEED_PORT PORTC
+#define STEP_FEED_MASK PIN0_bm
+#define STEP_FEED_CONTROL PORTC.PIN0CTRL
 
 
 //instantiate class/structure instances
@@ -126,7 +134,7 @@ ISR (TCA0_HUNF_vect)
 	//TCA0.SPLIT.INTFLAGS  //clear interrupt flag
 	if (spindle_ramp_counter == 0)
 	{
-		TCA0.SPLIT.INTCTRL &= ~(TCA_SPLIT_HUNF_bm); //disable interrupt flag)
+		TCA0.SPLIT.INTCTRL &= ~(TCA_SPLIT_HUNF_bm); //disable interrupt
 	}
 	else
 	{
@@ -138,42 +146,31 @@ ISR (TCA0_HUNF_vect)
 //interrupt for TCB0 - toggle pin
 ISR (TCB0_INT_vect)
 {
-	//disable interrupts whilst clock updates
-	cli();
 	TCB0.INTFLAGS = TCB_CAPT_bm;  //Clear the interrupt flag 
-	step_feed_port.OUTTGL = step_feed_mask;  //Toggle step GPIO 
+	STEP_FEED_PORT.OUTTGL = STEP_FEED_MASK;  //Toggle step GPIO 
 	
 	//decrement ramp up counter
 	if (feed_ramp_counter > 0)
 	{
 		feed_ramp_counter--;
 	}
-	//enable interrupts once clock updated
-	sei();
 }
 
 //setup interrupt for changes on enable pins
 ISR (PORTA_PORT_vect)
 {
-	//disable interrupts whilst clock updates
-	cli();
-	spindle_enable_switch_port.INTFLAGS = PORT_INT_gm; //read pins and update flags (clear interrupt)
-	dir_spindle = ((spindle_direction_switch_port.IN & spindle_direction_switch_mask) >> spindle_direction_switch_pin_position);
-	run_spindle = ((spindle_enable_switch_port.IN & spindle_enable_switch_mask) >> spindle_enable_switch_pin_position) | dir_spindle;			
-	run_feed = ((feed_direction_switch_port.IN & feed_direction_switch_mask) >> feed_direction_switch_pin_position);
-	//enable interrupts once clock updated
-	sei();
+	SPINDLE_ENABLE_SWITCH_PORT.INTFLAGS = PORT_INT_gm; //clear interrupt
+	//read pins and update flags
+	dir_spindle = ((SPINDLE_DIRECTION_SWITCH_PORT.IN & SPINDLE_DIRECTION_SWITCH_MASK) >> SPINDLE_DIRECTION_SWITCH_PIN_POSITION);
+	run_spindle = ((SPINDLE_ENABLE_SWITCH_PORT.IN & SPINDLE_ENABLE_SWITCH_MASK) >> SPINDLE_ENABLE_SWITCH_PIN_POSITION) | dir_spindle;			
+	run_feed = ((FEED_DIRECTION_SWITCH_PORT.IN & FEED_DIRECTION_SWITCH_MASK) >> FEED_DIRECTION_SWITCH_PIN_POSITION);
 }
 
 //setup interrupt for changes on enable pins
 ISR (PORTB_PORT_vect)
 {
-	//disable interrupts whilst clock updates
-	cli();
-	feed_enable_switch_port.INTFLAGS = PORT_INT_gm; //read pins and update flags (clear interrupt)
-	run_feed = ((feed_enable_switch_port.IN & feed_enable_switch_mask) >> feed_enable_switch_pin_position);
-	//enable interrupts once clock updated
-	sei();
+	FEED_ENABLE_SWITCH_PORT.INTFLAGS = PORT_INT_gm; //clear interrupt
+	run_feed = ((FEED_ENABLE_SWITCH_PORT.IN & FEED_ENABLE_SWITCH_MASK) >> FEED_ENABLE_SWITCH_PIN_POSITION); //read pins
 }	
 
 
@@ -183,33 +180,33 @@ ISR (PORTB_PORT_vect)
 ///////////////////////////////////////////////////////////////////////////////
 int main(void)
 {
-	//set CPU to run at full speed (default is 3.3MHz)
-	cpu_clock_init();
-	
-	//set input, pull-ups on pins, interrupt from pins, etc
-	spindle_enable_switch_control =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm; 
-	spindle_direction_switch_control =	PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
-	feed_enable_switch_control =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
-	feed_direction_switch_control =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
 
 	//set outputs
-	step_spindle_port.DIRSET = step_spindle_mask;
-	step_spindle_port.OUTCLR = step_spindle_mask;
 	PORTMUX.CTRLC = PORTMUX_TCA03_ALTERNATE_gc; //TCA03 alt pin
+	STEP_SPINDLE_PORT.OUTCLR = STEP_SPINDLE_MASK;
+	STEP_SPINDLE_PORT.DIRSET = STEP_SPINDLE_MASK;
 	
-	step_feed_port.DIRSET = step_feed_mask;
-	step_feed_port.OUTCLR = step_feed_mask;
 	PORTMUX.CTRLD = PORTMUX_TCB0_ALTERNATE_gc; //TCB0 alt pin
+	STEP_FEED_PORT.OUTCLR = STEP_FEED_MASK;
+	STEP_FEED_PORT.DIRSET = STEP_FEED_MASK;
 	
+	SPINDLE_ENABLE_CONTROL = PORT_INVEN_bm;
+	SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+	SPINDLE_ENABLE_PORT.DIRSET = SPINDLE_ENABLE_MASK;
+
+	FEED_ENABLE_CONTROL = PORT_INVEN_bm;
+	FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
+	FEED_ENABLE_PORT.DIRSET = FEED_ENABLE_MASK;
 	
-	spindle_enable_control = PORT_INVEN_bm;
-	spindle_enable_port.DIRSET = spindle_enable_mask;
-	spindle_enable_port.OUTCLR = spindle_enable_mask;
-	
-	feed_enable_control = PORT_INVEN_bm;
-	feed_enable_port.DIRSET = feed_enable_mask;
-	feed_enable_port.OUTCLR = feed_enable_mask;
-	
+	//set input, pull-ups on pins, interrupt from pins, etc
+	SPINDLE_ENABLE_SWITCH_CONTROL =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm |PORT_INVEN_bm;
+	SPINDLE_DIRECTION_SWITCH_CONTROL =	PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
+	FEED_ENABLE_SWITCH_CONTROL =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
+	FEED_DIRECTION_SWITCH_CONTROL =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
+
+
+	//set CPU to run at full speed (default is 3.3MHz)
+	cpu_clock_init();
 	
 	//initialise 
 	init_ADC();
@@ -220,10 +217,10 @@ int main(void)
 	//on startup if any switches (enable or direction are enabled, halt and wait for safe state
 	if (interlock == 1)
 	{
-		while ( (spindle_enable_switch_port.IN & spindle_enable_switch_mask) >= 1 
-		|| (spindle_direction_switch_port.IN & spindle_direction_switch_mask) >= 1
-		|| (feed_enable_switch_port.IN & feed_enable_switch_mask) >= 1
-		|| (feed_direction_switch_port.IN & feed_direction_switch_mask) >= 1 )
+		while ( (SPINDLE_ENABLE_SWITCH_PORT.IN & SPINDLE_ENABLE_SWITCH_MASK) >= 1 
+		|| (SPINDLE_DIRECTION_SWITCH_PORT.IN & SPINDLE_DIRECTION_SWITCH_MASK) >= 1
+		|| (FEED_ENABLE_SWITCH_PORT.IN & FEED_ENABLE_SWITCH_MASK) >= 1
+		|| (FEED_DIRECTION_SWITCH_PORT.IN & FEED_DIRECTION_SWITCH_MASK) >= 1 )
 		
 		{
 				//wait
@@ -231,19 +228,9 @@ int main(void)
 		
 		interlock = 0;
 		
-		//position lock the spindle
-		spindle_enable_port.OUTSET = spindle_enable_mask;
-		
-		for (uint8_t i = 0; i <= 6; i++)
-		{
-			step_spindle_port.OUTTGL = step_spindle_mask;
-			_delay_ms(min_spindle_driver_pulse_delay);
-		}
-		
-		step_spindle_port.OUTCLR = step_spindle_mask;
-		spindle_enable_port.OUTCLR = spindle_enable_mask;
+		//align the spindle encoder
+		syncronise_encoder();
 	}
-	
 	
 	//can start timers after all safe
 	init_timers();
@@ -266,7 +253,7 @@ int main(void)
 			TCB0.CTRLA &= ~TCB_ENABLE_bm;
 			
 			//scale main clock - default
-			spindle_clock_divider = bins-1; //div_max
+			spindle_clock_divider = BINS-1; //div_max
 			TCA0.SPLIT.CTRLA |= divider_array[spindle_clock_divider];
 			TCA0.SPLIT.CTRLB = TCA_SPLIT_HCMP0EN_bm; //enable timer interrupt
 			//setup safe - lowest frequency
@@ -280,20 +267,20 @@ int main(void)
 			
 			while (interlock == 0 && run_spindle == 0 && run_feed == 0)
 			{
-				feed_rate = bcd_input.bcd_to_int(); //read BCD counter
+				feed_rate = bcd_input.bcd_to_int(); //read BCD counter - 1/1000ths of a millimeter
 				analogue_value = (255 - get_adc(3)); //read potentiometer
 				
 				//set analogue value based on divider
-				analogue_value = (analogue_value / adc_block_size) + 1;
+				analogue_value = (analogue_value / STANDARD_CONTROL_STEPS) + 1;
 				
 				//calculate ideal RPM from analogue value
-				if ((uint16_t)analogue_value < (((uint16_t)max_rpm - 100) / 100))
+				if ((uint16_t)analogue_value < (((uint16_t)MAX_RPM - FINE_CONTROL_RPM) / 100))
 				{
-					spindle_speed = (uint16_t)((uint16_t)max_rpm - ((uint16_t)analogue_value * 100));
+					spindle_speed = (uint16_t)((uint16_t)MAX_RPM - ((uint16_t)analogue_value * 100));
 				} 
 				else
 				{
-					spindle_speed =  (uint16_t)(100 - ((uint16_t)analogue_value - ((((uint16_t)max_rpm - 100) / 100) + 1)) * sub_100_steps);
+					spindle_speed =  (uint16_t)(FINE_CONTROL_RPM - ((uint16_t)analogue_value - ((((uint16_t)MAX_RPM - FINE_CONTROL_RPM) / 100) + 1)) * FINE_CONTROL_STEPS);
 				}
 				
 				//calculate closest value clock settings to achieve requested / ideal rpm
@@ -301,12 +288,12 @@ int main(void)
 				uint16_t temp_value = -1; //max value
 						
 				//calculate for each clock divider and keep the one that's closest to the desired rpm
-				for (uint8_t n = 0; n < bins; n++)
+				for (uint8_t n = 0; n < BINS; n++)
 				{
 					//for each clock divider calculate the integer that gives rpm closest to requested
-					uint8_t temp_div_integer = (uint8_t)((float)cpu_speed / ((float)spindle_clock_divider_array[n] * (float)spindle_speed * (float)spindle_steps));
+					uint8_t temp_div_integer = (uint8_t)((float)CPU_SPEED / ((float)spindle_clock_divider_array[n] * (float)spindle_speed * (float)SPINDLE_STEPS));
 					//calculate the rpm values to allow calculation of the closest value
-					int16_t temp_div_rpm = (int16_t)(((float)cpu_speed / ((float)spindle_clock_divider_array[n]*float(temp_div_integer)*(float)spindle_steps)));
+					int16_t temp_div_rpm = (int16_t)(((float)CPU_SPEED / ((float)spindle_clock_divider_array[n]*float(temp_div_integer)*(float)SPINDLE_STEPS)));
 					//compare values to current best value
 					if ((uint16_t)abs((int16_t)spindle_speed - temp_div_rpm) < temp_value)
 					{
@@ -319,7 +306,7 @@ int main(void)
 				//update analogue value to nearest value for the selected clock divider
 				analogue_value = temp_integer;
 				
-				ramp_loops = (uint16_t)(ramp_acceleration * ((float)cpu_speed / ((float)spindle_clock_divider_array[spindle_clock_divider] * analogue_value * 1200)));
+				ramp_loops = (uint16_t)(RAMP_ACCELERATION * ((float)CPU_SPEED / ((float)spindle_clock_divider_array[spindle_clock_divider] * analogue_value * MAX_RPM)));
 				
 				//update the clock divider.
 				cli();
@@ -334,40 +321,42 @@ int main(void)
 		}
 		
 		//////////////////////////////////////////////////////////////////////////
-		//spindle only
-		while ( (interlock == 0 && run_spindle == 1 && run_feed == 0 && dir_spindle == 0) || (interlock == 0 && run_spindle == 1 && run_feed == 0 && dir_spindle == 1 && spindle_speed <= 20) )
+		//spindle only, allow reverse only when slow running
+		while ( (interlock == 0 && run_spindle == 1 && run_feed == 0 && dir_spindle == 0) 
+			 || (interlock == 0 && run_spindle == 1 && run_feed == 0 && dir_spindle == 1 && spindle_speed <= 20) )
 		{
-			_delay_ms(min_spindle_driver_pulse_delay);
-			
-			uint8_t old_dir_spindle = dir_spindle;
+			//_delay_ms(MIN_SPINDLE_DRIVER_PULSE_DELAY);
+			//syncronise_encoder();
 			
 			//check for previous running
-			if (spindle_ramp_counter != 0)
+			if (spindle_running == 0)
 			{				
+				//enable spindle motor
+				SPINDLE_ENABLE_PORT.OUTSET = SPINDLE_ENABLE_MASK;
+				spindle_running = 1;
+				_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay to allow init of driver
+
 				//enable timers
 				TCA0.SPLIT.CTRLA |= TCB_ENABLE_bm;
-				
-				//enable spindle motor
-				spindle_enable_port.OUTSET = spindle_enable_mask;
-				_delay_us(min_spindle_driver_pulse_delay); //delay to allow init of driver
 				
 				//ramp up
 				ramp_spindle_up();	
 			}
 					
-			while (interlock == 0 && run_spindle == 1 && run_feed == 0)
+			while (interlock == 0 && run_spindle == 1 && spindle_ramp_counter == 0 && run_feed == 0)
 			{
 				//hold here until interrupt
 			}
 			
 			//if spindle off after interrupt, then ramp down the spindle
-			if (run_spindle == 0 && old_dir_spindle == 0)
+			if (run_spindle == 0)
 			{
 				//ramp speed down
 				ramp_spindle_down();
 				
 				//disable spindle
-				spindle_enable_port.OUTCLR = spindle_enable_mask;
+				SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+				spindle_running = 0;
 			}
 			
 			
@@ -377,17 +366,17 @@ int main(void)
 		//feed only
 		while (interlock == 0 && run_spindle == 0 && run_feed == 1)
 		{
-			_delay_ms(min_spindle_driver_pulse_delay);
+			_delay_ms(MIN_SPINDLE_DRIVER_PULSE_DELAY);
 			
 			//set feed rate
-			TCB0.CCMP = feed_default_PER; //set pulse length
-			
-			//enable timers
-			TCB0.CTRLA |= TCB_ENABLE_bm;
+			TCB0.CCMP = FEED_DEFAULT_PER; //set pulse length
 			
 			//enable feed motor
-			feed_enable_port.OUTSET = feed_enable_mask;
-			_delay_us(min_spindle_driver_pulse_delay); //delay for allow driver startup
+			FEED_ENABLE_PORT.OUTSET = FEED_ENABLE_MASK;
+			_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay for allow driver startup
+
+			//enable timers
+			TCB0.CTRLA |= TCB_ENABLE_bm;
 			
 			while (interlock == 0 && run_spindle == 0 && run_feed == 1)
 			{
@@ -395,7 +384,7 @@ int main(void)
 			}
 			
 			//disable feed motor
-			feed_enable_port.OUTCLR = feed_enable_mask;
+			FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
 		}
 		
 		//////////////////////////////////////////////////////////////////////////
@@ -403,17 +392,15 @@ int main(void)
 		//spindle must be started / running before entering this mode
 		while (interlock == 0 && run_spindle == 1 && spindle_ramp_counter == 0 && run_feed == 1 && spindle_speed > 20)
 		{
-			_delay_ms(min_spindle_driver_pulse_delay);
-			
 			//set feed rate
-			TCB0.CCMP = feed_default_PER*20; //set pulse length
+			TCB0.CCMP = FEED_DEFAULT_PER*20; //set clock turn over slower speed during cuts
 			
 			//enable feed timer
 			TCB0.CTRLA |= TCB_ENABLE_bm; //enable clock	
 			
 			//enable feed motor
-			feed_enable_port.OUTSET = feed_enable_mask;
-			_delay_us(min_spindle_driver_pulse_delay); //delay for allow driver startup
+			FEED_ENABLE_PORT.OUTSET = FEED_ENABLE_MASK;
+			_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay for allow driver startup
 	
 			
 			while (interlock == 0 && run_spindle == 1 && spindle_ramp_counter == 0 && run_feed == 1 && spindle_speed > 20)
@@ -422,17 +409,17 @@ int main(void)
 			}
 			
 			//disable feed motor
-			feed_enable_port.OUTCLR = feed_enable_mask;
+			FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
 			
 			//if spindle off after interrupt, then ramp down the spindle
 			if (run_spindle == 0)
 			{
 				ramp_spindle_down();
 				
-				_delay_ms(100); //delay to allow init of driver
-				
-				//disable spindle
-				spindle_enable_port.OUTCLR = spindle_enable_mask;
+				//disable spindle & feed
+				SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+				FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
+				spindle_running = 0;
 			}
 		}
 		
@@ -440,7 +427,7 @@ int main(void)
 		//Engaged spindle with feed / slow spindle
 		while (interlock == 0 && run_spindle == 1 && run_feed == 1 && spindle_speed <= 20)
 		{
-			_delay_ms(min_spindle_driver_pulse_delay);
+			_delay_ms(MIN_SPINDLE_DRIVER_PULSE_DELAY);
 			
 			//disable timers
 			TCA0.SPLIT.CTRLA &= ~TCA_SPLIT_ENABLE_bm;
@@ -449,15 +436,16 @@ int main(void)
 			
 			//calculate stepping ratio
 			//convert feed_rate to the number of steps the spindle makes per step the feed makes
-			float spindle_steps_per_feed_step = (float)spindle_steps / ((float)feed_rate / feed_mm_per_step / 1000);
+			float spindle_steps_per_feed_step = (float)SPINDLE_STEPS / ((float)feed_rate / FEED_BCD_DIVISOR / FEED_MM_PER_STEP);
 			
 			volatile float current_decimal = spindle_steps_per_feed_step;
 			volatile uint16_t current_spindle_steps = (uint16_t)spindle_steps_per_feed_step; 
 			
 			//enable spindle & feed motor
-			spindle_enable_port.OUTSET = spindle_enable_mask;
-			feed_enable_port.OUTSET = feed_enable_mask;
-			_delay_us(min_spindle_driver_pulse_delay); //delay for allow driver startup
+			SPINDLE_ENABLE_PORT.OUTSET = SPINDLE_ENABLE_MASK;
+			spindle_running = 1;
+			FEED_ENABLE_PORT.OUTSET = FEED_ENABLE_MASK;
+			_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay for allow driver startup
 			
 			while (interlock == 0 && run_spindle == 1 && run_feed == 1 && spindle_speed <= 20)
 			{
@@ -478,8 +466,8 @@ int main(void)
 				//loop to required number of spindle steps per feed step - this can be zero
 				for (uint16_t i = current_spindle_steps; i > 0; i--)
 				{
-					step_spindle_port.OUTTGL = step_spindle_mask;  //Toggle step GPIO 
-					_delay_us(min_spindle_driver_pulse_delay/2); //delay
+					STEP_SPINDLE_PORT.OUTTGL = STEP_SPINDLE_MASK;  //Toggle step GPIO 
+					_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay
 					
 					if (run_spindle == 0)
 					{
@@ -487,13 +475,14 @@ int main(void)
 					}
 				}
 				
-				step_feed_port.OUTTGL = step_feed_mask;  //Toggle step GPIO 
-				_delay_us(min_spindle_driver_pulse_delay/2); //delay
+				STEP_FEED_PORT.OUTTGL = STEP_FEED_MASK;  //Toggle feed step 
+				_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay
 			}
 			
 			//disable spindle & feed
-			spindle_enable_port.OUTCLR = spindle_enable_mask;
-			feed_enable_port.OUTCLR = feed_enable_mask;
+			SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+			spindle_running = 0;
+			FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
 		}
     }
 	
@@ -585,7 +574,7 @@ uint16_t get_adc(uint8_t sel_pin)
 uint16_t rpm_out(uint16_t per_size)
 {
 	
-	uint16_t out_number = uint16_t(((float)cpu_speed / ((float)spindle_clock_divider_array[spindle_clock_divider]*float(per_size)*(float)spindle_steps)));
+	uint16_t out_number = uint16_t(((float)CPU_SPEED / ((float)spindle_clock_divider_array[spindle_clock_divider]*float(per_size)*(float)SPINDLE_STEPS)));
 	
 	return out_number;
 	
@@ -620,11 +609,13 @@ void ramp_spindle_up()
 		if (run_spindle == 0)
 		{
 			//disable spindle
-			spindle_enable_port.OUTCLR = spindle_enable_mask;
-			
+			SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+			spindle_running = 0;
+
 			//exit ramp up
 			return;
 		}
+
 	}
 }
 
@@ -632,7 +623,7 @@ void ramp_spindle_up()
 void ramp_spindle_down()
 {
 	//ramp the frequency
-	for (uint8_t n = analogue_value; n <= 64; n++)
+	for (uint8_t n = analogue_value; n <= 92; n++)
 	{
 		TCA0.SPLIT.HPER = n;
 		TCA0.SPLIT.HCMP0 = n/2; //HPER divide by 2 ~50% duty cycle
@@ -645,7 +636,27 @@ void ramp_spindle_down()
 		{
 			//hold here until interrupt loop finished
 		}
+
+		TCA0.SPLIT.INTCTRL &= ~(TCA_SPLIT_HUNF_bm); //disable interrupt
 	}
 }
 
 
+void syncronise_encoder()
+{
+	//position lock the spindle
+	SPINDLE_ENABLE_PORT.OUTSET = SPINDLE_ENABLE_MASK;
+	spindle_running = 1;
+	
+	//step the spindle to ensure that the encoder is aligned
+	for (uint8_t i = 0; i <= 6; i++)
+	{
+		STEP_SPINDLE_PORT.OUTTGL = STEP_SPINDLE_MASK;
+		_delay_ms(MIN_SPINDLE_DRIVER_PULSE_DELAY);
+	}
+	
+	//disable the spindle
+	STEP_SPINDLE_PORT.OUTCLR = STEP_SPINDLE_MASK;
+	SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+	spindle_running = 0;
+}
