@@ -17,6 +17,7 @@
 void cpu_clock_init();
 void init_ADC();
 void init_timers();
+void interlock_check();
 uint16_t get_adc(uint8_t sel_pin); //sel_pin = ADC_V or ADC_I
 void variable_delay(uint16_t delay);
 uint16_t rpm_out(uint16_t per_size);
@@ -159,8 +160,11 @@ ISR (TCB0_INT_vect)
 //setup interrupt for changes on enable pins
 ISR (PORTA_PORT_vect)
 {
+	_delay_ms(1); //clunky switch debounce
+	
 	SPINDLE_ENABLE_SWITCH_PORT.INTFLAGS = PORT_INT_gm; //clear interrupt
 	//read pins and update flags
+
 	dir_spindle = ((SPINDLE_DIRECTION_SWITCH_PORT.IN & SPINDLE_DIRECTION_SWITCH_MASK) >> SPINDLE_DIRECTION_SWITCH_PIN_POSITION);
 	run_spindle = ((SPINDLE_ENABLE_SWITCH_PORT.IN & SPINDLE_ENABLE_SWITCH_MASK) >> SPINDLE_ENABLE_SWITCH_PIN_POSITION) | dir_spindle;			
 	run_feed = ((FEED_DIRECTION_SWITCH_PORT.IN & FEED_DIRECTION_SWITCH_MASK) >> FEED_DIRECTION_SWITCH_PIN_POSITION);
@@ -169,7 +173,9 @@ ISR (PORTA_PORT_vect)
 //setup interrupt for changes on enable pins
 ISR (PORTB_PORT_vect)
 {
+	_delay_ms(1); //clunky switch debounce
 	FEED_ENABLE_SWITCH_PORT.INTFLAGS = PORT_INT_gm; //clear interrupt
+
 	run_feed = ((FEED_ENABLE_SWITCH_PORT.IN & FEED_ENABLE_SWITCH_MASK) >> FEED_ENABLE_SWITCH_PIN_POSITION); //read pins
 }	
 
@@ -180,8 +186,18 @@ ISR (PORTB_PORT_vect)
 ///////////////////////////////////////////////////////////////////////////////
 int main(void)
 {
+	//set CPU to run at full speed (default is 3.3MHz)
+	cpu_clock_init();
 
 	//set outputs
+	SPINDLE_ENABLE_CONTROL = PORT_INVEN_bm;
+	SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+	SPINDLE_ENABLE_PORT.DIRSET = SPINDLE_ENABLE_MASK;
+
+	FEED_ENABLE_CONTROL = PORT_INVEN_bm;
+	FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
+	FEED_ENABLE_PORT.DIRSET = FEED_ENABLE_MASK;
+
 	PORTMUX.CTRLC = PORTMUX_TCA03_ALTERNATE_gc; //TCA03 alt pin
 	STEP_SPINDLE_PORT.OUTCLR = STEP_SPINDLE_MASK;
 	STEP_SPINDLE_PORT.DIRSET = STEP_SPINDLE_MASK;
@@ -190,14 +206,6 @@ int main(void)
 	STEP_FEED_PORT.OUTCLR = STEP_FEED_MASK;
 	STEP_FEED_PORT.DIRSET = STEP_FEED_MASK;
 	
-	SPINDLE_ENABLE_CONTROL = PORT_INVEN_bm;
-	SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
-	SPINDLE_ENABLE_PORT.DIRSET = SPINDLE_ENABLE_MASK;
-
-	FEED_ENABLE_CONTROL = PORT_INVEN_bm;
-	FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
-	FEED_ENABLE_PORT.DIRSET = FEED_ENABLE_MASK;
-	
 	//set input, pull-ups on pins, interrupt from pins, etc
 	SPINDLE_ENABLE_SWITCH_CONTROL =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm |PORT_INVEN_bm;
 	SPINDLE_DIRECTION_SWITCH_CONTROL =	PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
@@ -205,38 +213,22 @@ int main(void)
 	FEED_DIRECTION_SWITCH_CONTROL =		PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm | PORT_INVEN_bm;
 
 
-	//set CPU to run at full speed (default is 3.3MHz)
-	cpu_clock_init();
-	
 	//initialise 
 	init_ADC();
 	led.init();
 	bcd_input.init();
 	
-	
-	//on startup if any switches (enable or direction are enabled, halt and wait for safe state
-	if (interlock == 1)
-	{
-		while ( (SPINDLE_ENABLE_SWITCH_PORT.IN & SPINDLE_ENABLE_SWITCH_MASK) >= 1 
-		|| (SPINDLE_DIRECTION_SWITCH_PORT.IN & SPINDLE_DIRECTION_SWITCH_MASK) >= 1
-		|| (FEED_ENABLE_SWITCH_PORT.IN & FEED_ENABLE_SWITCH_MASK) >= 1
-		|| (FEED_DIRECTION_SWITCH_PORT.IN & FEED_DIRECTION_SWITCH_MASK) >= 1 )
-		
-		{
-				//wait
-		}
-		
-		interlock = 0;
-		
-		//align the spindle encoder
-		syncronise_encoder();
-	}
-	
+	//interlock_check
+	interlock_check();
+
 	//can start timers after all safe
 	init_timers();
 	
 	//enable interrupts
 	sei();
+
+	//align the spindle encoder
+	syncronise_encoder();
 	
     while (1) 
     {
@@ -245,6 +237,10 @@ int main(void)
 		//////////////////////////////////////////////////////////////////////////
 		//main loop
 		
+		//interlock_check
+		interlock_check();
+		
+
 		//while waiting for startup
 		while (interlock == 0 && run_spindle == 0 && run_feed == 0)
 		{
@@ -259,10 +255,6 @@ int main(void)
 			//setup safe - lowest frequency
 			TCA0.SPLIT.HPER = 255;
 			TCA0.SPLIT.HCMP0 = 128;
-			
-			//set the ramp counters to max
-			spindle_ramp_counter = -1;
-			feed_ramp_counter = -1;
 			
 			
 			while (interlock == 0 && run_spindle == 0 && run_feed == 0)
@@ -353,10 +345,6 @@ int main(void)
 			{
 				//ramp speed down
 				ramp_spindle_down();
-				
-				//disable spindle
-				SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
-				spindle_running = 0;
 			}
 			
 			
@@ -390,7 +378,7 @@ int main(void)
 		//////////////////////////////////////////////////////////////////////////
 		//standard spindle with feed - feed rate number is arbitrary value
 		//spindle must be started / running before entering this mode
-		while (interlock == 0 && run_spindle == 1 && spindle_ramp_counter == 0 && run_feed == 1 && spindle_speed > 20)
+		while (interlock == 0 && run_spindle == 1 && run_feed == 1 && spindle_speed > 20 && spindle_ramp_counter == 0)
 		{
 			//set feed rate
 			TCB0.CCMP = FEED_DEFAULT_PER*20; //set clock turn over slower speed during cuts
@@ -403,7 +391,7 @@ int main(void)
 			_delay_us(MIN_SPINDLE_DRIVER_PULSE_DELAY); //delay for allow driver startup
 	
 			
-			while (interlock == 0 && run_spindle == 1 && spindle_ramp_counter == 0 && run_feed == 1 && spindle_speed > 20)
+			while (interlock == 0 && run_spindle == 1 && run_feed == 1 && spindle_speed > 20 && spindle_ramp_counter == 0)
 			{
 				//hold here until interrupt
 			}
@@ -415,11 +403,6 @@ int main(void)
 			if (run_spindle == 0)
 			{
 				ramp_spindle_down();
-				
-				//disable spindle & feed
-				SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
-				FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
-				spindle_running = 0;
 			}
 		}
 		
@@ -481,8 +464,10 @@ int main(void)
 			
 			//disable spindle & feed
 			SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
-			spindle_running = 0;
 			FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
+			spindle_running = 0;
+			interlock = 1;
+
 		}
     }
 	
@@ -554,6 +539,31 @@ void init_timers()
 	TCB0.INTCTRL = TCB_CAPT_bm; //enable interrupt for clocking pin
 }
 
+
+
+void interlock_check()
+{
+	//on startup if any switches (enable or direction are enabled, halt and wait for safe state
+	if (interlock == 1)
+	{
+		while ( (SPINDLE_ENABLE_SWITCH_PORT.IN & SPINDLE_ENABLE_SWITCH_MASK) >= 1
+		|| (SPINDLE_DIRECTION_SWITCH_PORT.IN & SPINDLE_DIRECTION_SWITCH_MASK) >= 1
+		|| (FEED_ENABLE_SWITCH_PORT.IN & FEED_ENABLE_SWITCH_MASK) >= 1
+		|| (FEED_DIRECTION_SWITCH_PORT.IN & FEED_DIRECTION_SWITCH_MASK) >= 1 )
+		
+		{
+			//wait
+		}
+		
+		interlock = 0;
+
+		//set the ramp counters to max
+		spindle_ramp_counter = -1;
+		feed_ramp_counter = -1;
+	}
+}
+
+
 //read ADC value
 uint16_t get_adc(uint8_t sel_pin)
 {
@@ -608,9 +618,11 @@ void ramp_spindle_up()
 		//if ramp up canceled then exit and disable
 		if (run_spindle == 0)
 		{
-			//disable spindle
-			SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+			SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK; //disable spindle
+			TCA0.SPLIT.INTCTRL &= ~(TCA_SPLIT_HUNF_bm); //disable interrupt
+			spindle_ramp_counter = 0; 
 			spindle_running = 0;
+			interlock = 1;
 
 			//exit ramp up
 			return;
@@ -639,6 +651,12 @@ void ramp_spindle_down()
 
 		TCA0.SPLIT.INTCTRL &= ~(TCA_SPLIT_HUNF_bm); //disable interrupt
 	}
+
+	//disable spindle & feed
+	SPINDLE_ENABLE_PORT.OUTCLR = SPINDLE_ENABLE_MASK;
+	FEED_ENABLE_PORT.OUTCLR = FEED_ENABLE_MASK;
+	spindle_running = 0;
+	interlock = 1; //wait for controls to be reset before allowing other commands
 }
 
 
